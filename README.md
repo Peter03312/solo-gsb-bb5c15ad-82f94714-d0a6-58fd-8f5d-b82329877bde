@@ -19,6 +19,11 @@ $C=J\Sigma J^{T}$，一次返回 2～8 个输出量的值、单位、合成标�
 稳定计算落入闭规格区间的概率 $p$（保留可表示的非零尾部概率），按置信阈值 $t$ 判定
 合格/不合格/待定，并给出固定 $u_c$ 时使 $p\ge t$ 的接受区间。
 
+另提供**重复性 A 类不确定度**接口：对等间隔重复读数去均值后，按 Bartlett（三角）
+权重加权的自协方差估计均值的 A 类标准不确定度 $u_A$，返回均值、各滞后自协方差与
+有效样本量 $n_{\mathrm{eff}}$；$u_A$ 数值可直接填入 `/api/v1/propagate` 的
+`standard_uncertainty`。
+
 ## 启动
 
 单条命令一键启动（Docker Compose）：
@@ -45,6 +50,7 @@ docker compose up --build
 - `POST /api/v1/allocate-uncertainty` — 不确定度逆分配（见下）
 - `POST /api/v1/propagate-monte-carlo` — 非线性模型的蒙特卡洛传播校核（见下）
 - `POST /api/v1/conformity` — 规格符合性判定（见下）
+- `POST /api/v1/repeatability` — 等间隔重复读数的 A 类标准不确定度（见下）
 - 交互文档：`http://localhost:8000/docs`
 
 ### 多输出联合传播 `POST /api/v1/propagate-joint`
@@ -347,3 +353,76 @@ curl -s http://localhost:8000/api/v1/conformity \
 | `greater_than` / `less_than` | `confidence_threshold` | 置信阈值未严格落在 $(0.5,1)$ 内 |
 
 相关矩阵非法、公式不合法、输入量单位错误等沿用传播接口的同一套校验与 code/loc。
+
+### 重复性 A 类不确定度 `POST /api/v1/repeatability`
+
+供**等间隔重复读数**估计均值的 A 类标准不确定度（Bartlett 窗自协方差，可处理读数间
+自相关）。请求体：
+
+- `readings` — **至少 3 个**等间隔重复读数（同一单位，须为有限实数，拒绝 NaN/Inf）；
+- `unit` — 读数单位（如 `mV`、`degC`），无法识别时返回 **422**；**结果单位保持
+  输入单位**，不做任何换算；
+- `max_lag` — 最大滞后 $L$（整数，须满足 $0\le L<n$，$n$ 为读数数量）。
+
+服务端先去均值 $d_i=x_i-\bar{x}$，按有偏估计（除以 $n$）计算滞后 $k$ 的自协方差
+
+$$
+\gamma_k=\frac{1}{n}\sum_{i=1}^{n-k} d_i\,d_{i+k},\qquad k=0,\dots,L
+$$
+
+再用 Bartlett（三角）权重 $w_k=1-\dfrac{k}{L+1}$ 估计均值的方差
+
+$$
+u_A^2=\frac{1}{n}\left[\gamma_0+2\sum_{k=1}^{L} w_k\,\gamma_k\right]
+$$
+
+Bartlett 窗对应 Fejér 核，配合有偏自协方差估计保证上式非负（$L=0$ 时退化为
+$u_A=\sqrt{\gamma_0/n}$，$n_{\mathrm{eff}}=n$）。响应返回：
+
+- `result` — 均值（`value`）、单位与 $u_A$（`standard_uncertainty`）；$u_A$ 数值
+  可直接填入 `/api/v1/propagate` 的 `standard_uncertainty`（标量形式按输入量自身
+  单位解释）；
+- `autocovariances` — 滞后 $0\sim L$ 的各自协方差 $\gamma_k$（单位为读数单位的
+  平方）；
+- `effective_sample_size` — 有效样本量
+  $n_{\mathrm{eff}}=n\gamma_0\big/\big[\gamma_0+2\sum_{k=1}^{L}w_k\gamma_k\big]$；
+  分母为零（全部读数相同，$\gamma_0=0$，此时 $u_A=0$）时为 `null`。
+
+请求示例（8 个 mV 读数，$L=3$）：
+
+```bash
+curl -s http://localhost:8000/api/v1/repeatability \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "readings": [10.02, 9.98, 10.01, 10.03, 9.99, 10.0, 10.02, 9.97],
+    "unit": "mV",
+    "max_lag": 3
+  }'
+```
+
+响应：
+
+```json
+{
+  "result": {"value": 10.0025, "unit": "mV", "standard_uncertainty": 0.0044304521496117645},
+  "number_of_readings": 8,
+  "max_lag": 3,
+  "autocovariances": [
+    {"lag": 0, "value": 0.0003937499999999832, "unit": "mV ** 2"},
+    {"lag": 1, "value": -0.00016015624999999234, "unit": "mV ** 2"},
+    {"lag": 2, "value": -9.84374999999947e-05, "unit": "mV ** 2"},
+    {"lag": 3, "value": 0.00020390624999999213, "unit": "mV ** 2"}
+  ],
+  "effective_sample_size": 20.059701492536963
+}
+```
+
+以下情况返回 **422**，错误体带明确 `code` 与 `loc`：
+
+| code | loc | 含义 |
+| --- | --- | --- |
+| `too_short` | `readings` | 读数少于 3 个 |
+| `finite_number` | `readings.<i>` | 第 i 个读数为 NaN/Inf 等非有限值 |
+| `empty_unit` / `unknown_unit` | `unit` | 单位为空或无法识别 |
+| `greater_than_equal` | `max_lag` | $L<0$ |
+| `invalid_max_lag` | `max_lag` | $L\ge n$（须满足 $0\le L<n$） |

@@ -1298,4 +1298,155 @@ r = client.post(
 )
 assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_symbol"
 
+# --- POST /api/v1/repeatability ---------------------------------------------
+
+# 63) 8 个 mV 读数，L=3：均值/γ_k/u_A/n_eff 与手算一致（偏差为 0.0025 的整数倍）
+r = client.post(
+    "/api/v1/repeatability",
+    json={
+        "readings": [10.02, 9.98, 10.01, 10.03, 9.99, 10.0, 10.02, 9.97],
+        "unit": "mV",
+        "max_lag": 3,
+    },
+)
+show("63) repeatability 8 readings mV, L=3", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["number_of_readings"] == 8 and b["max_lag"] == 3
+assert abs(b["result"]["value"] - 10.0025) < 1e-12
+assert b["result"]["unit"] == "mV"  # 结果单位保持输入单位
+ac = b["autocovariances"]
+assert [t["lag"] for t in ac] == [0, 1, 2, 3]
+assert all(t["unit"] == "mV ** 2" for t in ac)
+g = [t["value"] for t in ac]
+assert abs(g[0] - 3.9375e-4) < 1e-15
+assert abs(g[1] - (-1.6015625e-4)) < 1e-15
+assert abs(g[2] - (-9.84375e-5)) < 1e-15
+assert abs(g[3] - 2.0390625e-4) < 1e-15
+# S = γ0 + 2(0.75γ1 + 0.5γ2 + 0.25γ3) = 1.5703125e-4，u_A = sqrt(S/8)
+u_a = b["result"]["standard_uncertainty"]
+assert abs(u_a - math.sqrt(1.962890625e-5)) < 1e-15
+# n_eff = 8·γ0/S = 504/25.125
+assert abs(b["effective_sample_size"] - 504.0 / 25.125) < 1e-9
+
+# 64) [1,2,3,4]，L=2：γ 精确等于分数，u_A=sqrt(17/48)，n_eff=60/17
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1, 2, 3, 4], "unit": "mV", "max_lag": 2},
+)
+show("64) readings 1..4, L=2", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["result"]["value"] == 2.5
+assert [t["value"] for t in b["autocovariances"]] == [1.25, 0.3125, -0.375]
+assert abs(b["result"]["standard_uncertainty"] - math.sqrt(17.0 / 48.0)) < 1e-15
+assert abs(b["effective_sample_size"] - 60.0 / 17.0) < 1e-12
+
+# 65) L=0：退化为 u_A=sqrt(γ0/n)，n_eff=n
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1, 2, 3, 4], "unit": "mV", "max_lag": 0},
+)
+show("65) L=0", r.json())
+assert r.status_code == 200
+b = r.json()
+assert len(b["autocovariances"]) == 1
+assert abs(b["result"]["standard_uncertainty"] - math.sqrt(1.25 / 4.0)) < 1e-15
+assert b["effective_sample_size"] == 4.0
+
+# 66) 读数全相同：γ_k 全 0，u_A=0，分母为零 -> n_eff=null
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [7.5, 7.5, 7.5, 7.5], "unit": "V", "max_lag": 2},
+)
+show("66) identical readings -> u_A=0, n_eff=null", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["result"]["standard_uncertainty"] == 0.0
+assert b["effective_sample_size"] is None
+assert all(t["value"] == 0.0 for t in b["autocovariances"])
+
+# 67) L 边界：L=n-1 合法；L=n -> 422 invalid_max_lag；L=-1 -> 422
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1, 2, 3], "unit": "mV", "max_lag": 2},
+)
+assert r.status_code == 200
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1, 2, 3], "unit": "mV", "max_lag": 3},
+)
+show("67) L=n -> 422 invalid_max_lag", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "invalid_max_lag"
+assert r.json()["error"]["loc"] == ["max_lag"]
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1, 2, 3], "unit": "mV", "max_lag": -1},
+)
+assert r.status_code == 422 and r.json()["error"]["loc"] == ["max_lag"]
+
+# 68) 读数不足 3 个 -> 422 loc readings
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1, 2], "unit": "mV", "max_lag": 0},
+)
+show("68) two readings -> 422", r.json())
+assert r.status_code == 422 and r.json()["error"]["loc"] == ["readings"]
+
+# 69) 非有限读数（NaN/±Inf，原始 JSON 注入）-> 422 定位到 readings.1
+for token in ("NaN", "Infinity", "-Infinity"):
+    r = client.post(
+        "/api/v1/repeatability",
+        content=(
+            '{"readings": [1.0, %s, 3.0], "unit": "mV", "max_lag": 1}' % token
+        ),
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422, (token, r.status_code)
+    assert r.json()["error"]["code"] == "finite_number"
+    assert r.json()["error"]["loc"] == ["readings", 1]
+
+# 70) 未知单位 -> 422 unknown_unit loc unit
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1, 2, 3], "unit": "frobnicate", "max_lag": 1},
+)
+show("70) unknown unit -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "unknown_unit"
+assert r.json()["error"]["loc"] == ["unit"]
+
+# 71) u_A 数值直接填入 /api/v1/propagate 的 standard_uncertainty（同单位）
+r = client.post(
+    "/api/v1/repeatability",
+    json={
+        "readings": [10.02, 9.98, 10.01, 10.03, 9.99, 10.0, 10.02, 9.97],
+        "unit": "V",
+        "max_lag": 3,
+    },
+)
+assert r.status_code == 200
+rep = r.json()
+r = client.post(
+    "/api/v1/propagate",
+    json={
+        "inputs": [
+            {
+                "name": "U",
+                "value": rep["result"]["value"],
+                "unit": "V",
+                "standard_uncertainty": rep["result"]["standard_uncertainty"],
+            }
+        ],
+        "formula": "U*2",
+    },
+)
+show("71) u_A feeds /propagate standard_uncertainty", r.json())
+assert r.status_code == 200
+assert abs(
+    r.json()["result"]["standard_uncertainty"]
+    - 2 * rep["result"]["standard_uncertainty"]
+) < 1e-15
+
 print("\nALL TESTS PASSED")

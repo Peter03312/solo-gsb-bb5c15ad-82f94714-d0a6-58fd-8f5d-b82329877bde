@@ -443,3 +443,48 @@ class ConformityResponse(BaseModel):
     )
     acceptance_interval: AcceptanceInterval
     formula: str
+
+
+# -- 重复性 A 类不确定度 ---------------------------------------------------------
+
+
+class RepeatabilityRequest(BaseModel):
+    """等间隔重复读数的 A 类不确定度请求：至少 3 个同单位读数 + 单位 + 最大滞后 L。"""
+
+    readings: list[FiniteFloat] = Field(
+        ...,
+        min_length=3,
+        description="等间隔重复读数（至少 3 个，同一单位，须为有限实数）",
+    )
+    unit: str = Field(
+        ..., min_length=1, description="读数单位（如 mV / degC）；结果保持该单位"
+    )
+    max_lag: int = Field(
+        ..., ge=0, description="最大滞后 L（整数）；须满足 0 ≤ L < 读数数量"
+    )
+
+
+class AutocovarianceTerm(BaseModel):
+    """滞后 k 的自协方差 γ_k（有偏估计，除以 n）。"""
+
+    lag: int = Field(..., description="滞后 k")
+    value: float = Field(..., description="γ_k 数值")
+    unit: str = Field(..., description="γ_k 单位（读数单位的平方）")
+
+
+class RepeatabilityResponse(BaseModel):
+    """A 类不确定度响应：均值、u_A、各滞后自协方差与有效样本量。"""
+
+    result: QuantityResult = Field(
+        ...,
+        description="均值（value）、单位与均值的 A 类标准不确定度 u_A（standard_uncertainty）",
+    )
+    number_of_readings: int = Field(..., description="读数数量 n")
+    max_lag: int = Field(..., description="回显最大滞后 L")
+    autocovariances: list[AutocovarianceTerm] = Field(
+        ..., description="滞后 0..L 的自协方差 γ_k（按滞后升序）"
+    )
+    effective_sample_size: float | None = Field(
+        ...,
+        description="有效样本量 n_eff = nγ_0/(γ_0+2Σ…)；分母为零（读数全相同）时为 null",
+    )
