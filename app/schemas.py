@@ -443,3 +443,54 @@ class ConformityResponse(BaseModel):
     )
     acceptance_interval: AcceptanceInterval
     formula: str
+
+
+# -- A 类标准不确定度（重复读数）-------------------------------------------
+
+
+class RepeatabilityRequest(BaseModel):
+    """等间隔重复读数的 A 类标准不确定度估计请求。"""
+
+    readings: list[FiniteFloat] = Field(
+        ...,
+        min_length=3,
+        description="同一被测量的等间隔重复读数（至少 3 个，同一单位；拒绝 NaN/Inf）",
+    )
+    unit: str = Field(..., min_length=1, description="全部读数的共同单位，如 V / m / mV")
+    max_lag: int = Field(
+        ...,
+        ge=0,
+        description="自协方差最大滞后 L，须满足 0 ≤ L < 读数数量 n",
+    )
+
+
+class Autocovariance(BaseModel):
+    """单个滞后 k 的有偏自协方差估计 γ_k（除以 n）。"""
+
+    lag: int = Field(..., description="滞后阶数 k（0 ≤ k ≤ L）")
+    value: float = Field(..., description="γ_k，1/n 归一化的样本自协方差")
+    unit: str = Field(..., description="自协方差单位 = 读数单位的平方，如 V ** 2")
+
+
+class RepeatabilityResponse(BaseModel):
+    """A 类标准不确定度估计响应：均值、u_A、各滞后自协方差与有效样本量。"""
+
+    result: QuantityResult = Field(
+        ...,
+        description="读数均值（value）、单位与 A 类标准不确定度 u_A；"
+        "standard_uncertainty 可直接填入 /api/v1/propagate 的 standard_uncertainty",
+    )
+    number_of_readings: int = Field(..., description="读数数量 n")
+    max_lag: int = Field(..., description="回显最大滞后 L")
+    autocovariances: list[Autocovariance] = Field(
+        ..., description="各滞后 γ_k（k=0..L），1/n 归一化"
+    )
+    variance: float = Field(
+        ...,
+        description="均值方差 u_A² = [γ_0 + 2 Σ_{k=1}^L (1−k/(L+1)) γ_k] / n",
+    )
+    variance_unit: str = Field(..., description="u_A² 的单位 = 读数单位的平方")
+    effective_sample_size: float | None = Field(
+        ...,
+        description="有效样本量 n_eff = n γ_0 / [γ_0 + 2 Σ…]；分母为零时为 null",
+    )

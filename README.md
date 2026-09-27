@@ -19,6 +19,12 @@ $C=J\Sigma J^{T}$，一次返回 2～8 个输出量的值、单位、合成标�
 稳定计算落入闭规格区间的概率 $p$（保留可表示的非零尾部概率），按置信阈值 $t$ 判定
 合格/不合格/待定，并给出固定 $u_c$ 时使 $p\ge t$ 的接受区间。
 
+另提供**重复读数 A 类标准不确定度**接口：对同一被测量的等间隔重复读数先去均值，
+按 1/n 归一化计算各滞后自协方差 $\gamma_k$，再用 Bartlett 三角权重估计均值的
+A 类标准不确定度 $u_A$（修正序列自相关对朴素 $s/\sqrt n$ 的影响），返回均值、
+$u_A$、各滞后 $\gamma_k$ 与有效样本量 $n_{\mathrm{eff}}$；$u_A$ 可直接填入
+`/api/v1/propagate` 的 `standard_uncertainty`。
+
 ## 启动
 
 单条命令一键启动（Docker Compose）：
@@ -45,6 +51,7 @@ docker compose up --build
 - `POST /api/v1/allocate-uncertainty` — 不确定度逆分配（见下）
 - `POST /api/v1/propagate-monte-carlo` — 非线性模型的蒙特卡洛传播校核（见下）
 - `POST /api/v1/conformity` — 规格符合性判定（见下）
+- `POST /api/v1/repeatability` — 等间隔重复读数的 A 类标准不确定度（见下）
 - 交互文档：`http://localhost:8000/docs`
 
 ### 多输出联合传播 `POST /api/v1/propagate-joint`
@@ -347,3 +354,78 @@ curl -s http://localhost:8000/api/v1/conformity \
 | `greater_than` / `less_than` | `confidence_threshold` | 置信阈值未严格落在 $(0.5,1)$ 内 |
 
 相关矩阵非法、公式不合法、输入量单位错误等沿用传播接口的同一套校验与 code/loc。
+
+### 重复读数 A 类标准不确定度 `POST /api/v1/repeatability`
+
+对同一被测量按等时间间隔取得的 $n$ 个同单位读数 $x_1,\dots,x_n$（请求字段
+`readings`，**至少 3 个**；`unit` 为全部读数的共同单位），先求均值
+$\bar x=\frac1n\sum_i x_i$ 并去均值 $d_i=x_i-\bar x$，按 **1/n 归一化**
+（有偏样本自协方差）计算滞后 $k$ 的自协方差：
+
+$$
+\gamma_k=\frac1n\sum_{i=1}^{n-k} d_i\,d_{i+k},\qquad k=0,1,\dots,L
+$$
+
+再用 Bartlett（三角）权重 $w_k=1-\frac{k}{L+1}$ 估计均值的 A 类方差：
+
+$$
+u_A^2=\frac{1}{n}\left[\gamma_0+2\sum_{k=1}^{L}\left(1-\frac{k}{L+1}\right)\gamma_k\right]
+$$
+
+其中 `max_lag` 即最大滞后 $L$，须满足整数 $0\le L<n$。等间隔读数若存在自相关，
+朴素 $s/\sqrt n$ 不再适用：**正自相关**使相邻读数携带重复信息，$u_A$ 应增大、
+有效样本量减小；负自相关则相反。响应同时返回有效样本量
+
+$$
+n_{\mathrm{eff}}=\frac{n\,\gamma_0}{\gamma_0+2\sum_{k=1}^{L}(1-\frac{k}{L+1})\gamma_k}
+$$
+
+（即加窗长程方差括号项对应的等效独立读数数量）；**分母为零时 $n_{\mathrm{eff}}$
+为 `null`**（如全部读数相同）。各 $\gamma_k$ 与 $u_A^2$ 的单位为读数单位的平方，
+均值与 $u_A$ 保持输入单位；`result.standard_uncertainty`（即 $u_A$）可直接填入
+`/api/v1/propagate` 输入量的 `standard_uncertainty`（同一 `unit`）。
+
+请求示例（8 个等间隔电压读数，$L=2$）：
+
+```bash
+curl -s http://localhost:8000/api/v1/repeatability \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "readings": [10.00, 10.01, 10.03, 10.02, 10.00, 9.98, 9.99, 10.01],
+    "unit": "V",
+    "max_lag": 2
+  }'
+```
+
+响应（$\bar x=10.005\,\mathrm{V}$，$\gamma_0=0.000225$、$\gamma_1=0.000103125$、
+$\gamma_2=-0.000075\,\mathrm{V^2}$，$u_A=0.00625\,\mathrm{V}$；正自相关使
+$n_{\mathrm{eff}}=5.76<n=8$。JSON 数值为双精度浮点，末位有舍入噪声）：
+
+```json
+{
+  "result": {"value": 10.004999999999999, "unit": "V", "standard_uncertainty": 0.006249999999999875},
+  "number_of_readings": 8,
+  "max_lag": 2,
+  "autocovariances": [
+    {"lag": 0, "value": 0.00022499999999999043, "unit": "V ** 2"},
+    {"lag": 1, "value": 0.00010312499999999561, "unit": "V ** 2"},
+    {"lag": 2, "value": -0.0000749999999999957, "unit": "V ** 2"}
+  ],
+  "variance": 0.00003906249999999843,
+  "variance_unit": "V ** 2",
+  "effective_sample_size": 5.7599999999999865
+}
+```
+
+取 `max_lag: 0` 时 $u_A^2=\gamma_0/n$（1/n 归一化的方差再除以 $n$，等价于
+$\frac{n-1}{n}\cdot\frac{s^2}{n}$），且恒有 $n_{\mathrm{eff}}=n$。以下情况返回
+**422**，错误体带明确 `code` 与 `loc`：
+
+| code | loc | 含义 |
+| --- | --- | --- |
+| `too_short` / `finite_number` 等 Pydantic 错误 | `readings` / `readings.<i>` | 读数少于 3 个，或含 `NaN`/`Infinity` 等非有限值 |
+| `empty_unit` / `unknown_unit` | `unit` | 单位为空或无法识别 |
+| `greater_than_equal` / `int_from_float` 等 Pydantic 错误 | `max_lag` | $L$ 非整数或为负数（须 $L\ge0$） |
+| `lag_too_large` | `max_lag` | $L\ge n$（最大滞后须严格小于读数数量） |
+| `negative_variance_estimate` | `max_lag` | 加窗长程方差显著为负（自协方差估计数值不自洽，建议减小 $L$） |
+

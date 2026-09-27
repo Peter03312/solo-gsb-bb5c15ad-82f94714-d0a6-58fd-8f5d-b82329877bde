@@ -11,6 +11,7 @@ from .formula import WHITELIST_DISPLAY
 from .joint import propagate_joint
 from .monte_carlo import propagate_monte_carlo
 from .propagation import propagate
+from .repeatability import assess_repeatability
 from .schemas import (
     AllocationRequest,
     AllocationResponse,
@@ -22,6 +23,8 @@ from .schemas import (
     MonteCarloPropagationResponse,
     PropagationRequest,
     PropagationResponse,
+    RepeatabilityRequest,
+    RepeatabilityResponse,
 )
 
 app = FastAPI(
@@ -102,6 +105,12 @@ _CONFORMITY_EXAMPLE = {
     "lower_limit": {"value": 18.5, "unit": "W"},
     "upper_limit": {"value": 21.5, "unit": "W"},
     "confidence_threshold": 0.95,
+}
+
+_REPEATABILITY_EXAMPLE = {
+    "readings": [10.00, 10.01, 10.03, 10.02, 10.00, 9.98, 9.99, 10.01],
+    "unit": "V",
+    "max_lag": 2,
 }
 
 
@@ -200,3 +209,24 @@ def allocate_uncertainty(req: AllocationRequest) -> dict:
 def check_conformity(req: ConformityRequest) -> dict:
     """规格符合性判定：一阶传播 + N(y, u_c²) 假设下落入闭规格区间的概率、判定与接受区间。"""
     return assess_conformity(req)
+
+
+@app.post(
+    "/api/v1/repeatability",
+    response_model=RepeatabilityResponse,
+    tags=["uncertainty"],
+    responses={
+        422: {
+            "description": (
+                "读数少于 3 个 / 含非有限值、单位无法识别，或最大滞后 L 越界"
+                "（lag_too_large / negative_variance_estimate）等"
+            )
+        }
+    },
+    openapi_extra={
+        "examples": {"等间隔电压重复读数，L=2 的 A 类标准不确定度": {"value": _REPEATABILITY_EXAMPLE}},
+    },
+)
+def estimate_repeatability(req: RepeatabilityRequest) -> dict:
+    """由等间隔重复读数估计均值的 A 类标准不确定度：1/n 自协方差 + Bartlett 加窗长程方差。"""
+    return assess_repeatability(req)

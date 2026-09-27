@@ -1298,4 +1298,185 @@ r = client.post(
 )
 assert r.status_code == 422 and r.json()["error"]["code"] == "unknown_symbol"
 
+# --- POST /api/v1/repeatability -------------------------------------------
+
+_REP_READINGS = [10.00, 10.01, 10.03, 10.02, 10.00, 9.98, 9.99, 10.01]
+
+# 63) 基本示例（n=8, L=2，正自相关）：精确有理数结果
+#   mean=10.005; gamma0=0.000225, gamma1=0.000103125, gamma2=-0.000075
+#   u_A^2 = [gamma0 + 2*(2/3*gamma1 + 1/3*gamma2)]/8 = 1/25600 -> u_A=0.00625
+#   n_eff = 8*gamma0 / 括号 = 5.76
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": _REP_READINGS, "unit": "V", "max_lag": 2},
+)
+show("63) repeatability n=8 L=2 (u_A=0.00625 V, n_eff=5.76)", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert b["number_of_readings"] == 8 and b["max_lag"] == 2
+assert b["result"]["unit"] == "V"
+assert abs(b["result"]["value"] - 10.005) < 1e-12
+assert abs(b["result"]["standard_uncertainty"] - 0.00625) < 1e-12
+assert [g["lag"] for g in b["autocovariances"]] == [0, 1, 2]
+assert all(g["unit"] == "V ** 2" for g in b["autocovariances"])
+assert abs(b["autocovariances"][0]["value"] - 0.000225) < 1e-12
+assert abs(b["autocovariances"][1]["value"] - 0.000103125) < 1e-12
+assert abs(b["autocovariances"][2]["value"] - (-0.000075)) < 1e-12
+assert abs(b["variance"] - 0.0000390625) < 1e-12
+assert b["variance_unit"] == "V ** 2"
+assert abs(b["effective_sample_size"] - 5.76) < 1e-10
+
+# 63b) u_A 可直接填入 /api/v1/propagate 的 standard_uncertainty
+r2 = client.post(
+    "/api/v1/propagate",
+    json={
+        "inputs": [
+            {"name": "U", "value": 10.0, "unit": "V",
+             "standard_uncertainty": b["result"]["standard_uncertainty"]}
+        ],
+        "formula": "U",
+    },
+)
+assert r2.status_code == 200, r2.text
+assert abs(r2.json()["result"]["standard_uncertainty"] - 0.00625) < 1e-12
+
+# 64) L=0：u_A^2 = gamma0/n，仅一个滞后；n_eff 恒为 n
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": _REP_READINGS, "unit": "V", "max_lag": 0},
+)
+show("64) repeatability L=0 (u_A^2=gamma0/n, n_eff=n)", r.json())
+assert r.status_code == 200
+b = r.json()
+assert len(b["autocovariances"]) == 1 and b["autocovariances"][0]["lag"] == 0
+assert abs(b["autocovariances"][0]["value"] - 0.000225) < 1e-12
+assert abs(b["variance"] - 0.000225 / 8) < 1e-12
+assert abs(b["result"]["standard_uncertainty"] - (0.000225 / 8) ** 0.5) < 1e-12
+assert b["effective_sample_size"] == 8.0
+
+# 65) 最少 3 个读数、L=n-1 上限
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1.0, 2.0, 3.0], "unit": "m", "max_lag": 2},
+)
+show("65) n=3 L=2", r.json())
+assert r.status_code == 200, r.text
+b = r.json()
+assert abs(b["result"]["value"] - 2.0) < 1e-12
+assert b["result"]["unit"] == "m"
+# mean=2, d=[-1,0,1]: gamma0=(1+0+1)/3=2/3, gamma1=0, gamma2=-1/3
+assert abs(b["autocovariances"][0]["value"] - 2 / 3) < 1e-12
+assert abs(b["autocovariances"][1]["value"] - 0.0) < 1e-12
+assert abs(b["autocovariances"][2]["value"] - (-1 / 3)) < 1e-12
+assert all(g["unit"] == "m ** 2" for g in b["autocovariances"])
+assert abs(b["effective_sample_size"] - 4.5) < 1e-10
+
+# 66) 全部读数相同：u_A=0，长程方差分母为 0 -> n_eff=null
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [5.0, 5.0, 5.0, 5.0], "unit": "Pa", "max_lag": 2},
+)
+show("66) constant readings -> u_A=0, n_eff=null", r.json())
+assert r.status_code == 200
+b = r.json()
+assert b["result"] == {"value": 5.0, "unit": "Pa", "standard_uncertainty": 0.0}
+assert all(g["value"] == 0.0 for g in b["autocovariances"])
+assert b["variance"] == 0.0
+assert b["variance_unit"] == "Pa ** 2"
+assert b["effective_sample_size"] is None
+
+# 67) 负自相关（交替序列）：n_eff 可大于 n；Bartlett 保证长程方差非负
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [-1.0, 1.0, -1.0, 1.0], "unit": "dimensionless", "max_lag": 1},
+)
+show("67) alternating L=1 (gamma0=1, gamma1=-0.75, n_eff=16)", r.json())
+assert r.status_code == 200
+b = r.json()
+assert abs(b["autocovariances"][0]["value"] - 1.0) < 1e-12
+assert abs(b["autocovariances"][1]["value"] - (-0.75)) < 1e-12
+assert b["autocovariances"][0]["unit"] == "dimensionless"
+assert abs(b["result"]["standard_uncertainty"] - 0.25) < 1e-12
+assert abs(b["effective_sample_size"] - 16.0) < 1e-10
+
+# 68) 单位保持：mV 回显；degC 偏移单位均值仍按声明数值、平方单位可展示
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [100.0, 102.0, 101.0], "unit": "mV", "max_lag": 1},
+)
+assert r.status_code == 200
+b = r.json()
+assert b["result"]["unit"] == "mV"
+assert b["autocovariances"][0]["unit"] == "mV ** 2"
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [20.0, 20.5, 20.2, 20.3], "unit": "degC", "max_lag": 2},
+)
+show("68) degC offset unit", r.json())
+assert r.status_code == 200
+b = r.json()
+assert abs(b["result"]["value"] - 20.25) < 1e-12 and b["result"]["unit"] == "°C"
+assert b["autocovariances"][0]["unit"] == "°C ** 2"
+assert b["variance_unit"] == "°C ** 2"
+
+# 69) 读数少于 3 个 -> 422 loc readings
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1.0, 2.0], "unit": "V", "max_lag": 0},
+)
+show("69) fewer than 3 readings -> 422", r.json())
+assert r.status_code == 422 and r.json()["error"]["loc"] == ["readings"]
+
+# 70) NaN/Infinity -> 422（原始 JSON 文本发送）
+for token in ("NaN", "Infinity", "-Infinity"):
+    r = client.post(
+        "/api/v1/repeatability",
+        content='{"readings": [1.0, %s, 3.0], "unit": "V", "max_lag": 0}' % token,
+        headers={"Content-Type": "application/json"},
+    )
+    assert r.status_code == 422 and r.json()["error"]["loc"][0] == "readings", token
+
+# 71) 单位非法 -> 422 loc unit（unknown_unit / empty_unit）
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1.0, 2.0, 3.0], "unit": "frobnicate", "max_lag": 0},
+)
+show("71) unknown unit -> 422", r.json())
+assert r.status_code == 422
+assert r.json()["error"]["code"] == "unknown_unit"
+assert r.json()["error"]["loc"] == ["unit"]
+r = client.post(
+    "/api/v1/repeatability",
+    json={"readings": [1.0, 2.0, 3.0], "unit": "   ", "max_lag": 0},
+)
+assert r.status_code == 422 and r.json()["error"]["loc"] == ["unit"]
+
+# 72) L >= n -> 422 lag_too_large loc max_lag
+for bad_l in (3, 99):
+    r = client.post(
+        "/api/v1/repeatability",
+        json={"readings": [1.0, 2.0, 3.0], "unit": "V", "max_lag": bad_l},
+    )
+    show(f"72) L={bad_l} >= n -> 422", r.json())
+    assert r.status_code == 422
+    assert r.json()["error"]["code"] == "lag_too_large"
+    assert r.json()["error"]["loc"] == ["max_lag"]
+
+# 73) L 为负数或非整数 -> 422 loc max_lag（pydantic）
+for bad_l in (-1, 1.5):
+    r = client.post(
+        "/api/v1/repeatability",
+        json={"readings": [1.0, 2.0, 3.0], "unit": "V", "max_lag": bad_l},
+    )
+    assert r.status_code == 422 and r.json()["error"]["loc"] == ["max_lag"], bad_l
+
+# 74) 缺字段 -> 422 定位到对应字段
+for body, field in [
+    ({"unit": "V", "max_lag": 0}, "readings"),
+    ({"readings": [1.0, 2.0, 3.0], "max_lag": 0}, "unit"),
+    ({"readings": [1.0, 2.0, 3.0], "unit": "V"}, "max_lag"),
+]:
+    r = client.post("/api/v1/repeatability", json=body)
+    assert r.status_code == 422 and r.json()["error"]["loc"] == [field], body
+
 print("\nALL TESTS PASSED")
